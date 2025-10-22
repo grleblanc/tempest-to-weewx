@@ -13,7 +13,7 @@ from typing import List, Dict, Any
 # --- Configuration ---
 # Default values - can be overridden by command-line arguments or environment variables
 DEFAULT_API_TOKEN = "0a36ab0b-baf7-4a0f-a108-e78119ccba96"  # Replace with a placeholder
-DEFAULT_STATION_ID = "25998"  # Replace with a placeholder
+DEFAULT_DEVICE_ID = "83997"  # Tempest device ID (not station ID!)
 DEFAULT_START_DATE = "2020-01-01"  # YYYY-MM-DD
 DEFAULT_OUTPUT_FILE = "wx.csv"
 DEFAULT_DB_PATH = "/data/archive/weewx.sdb"  # WeeWX database path
@@ -27,10 +27,14 @@ logging.basicConfig(
 )
 
 
-def get_tempest_data(start_ts, end_ts, api_token, station_id):
-    """Fetches weather data from the Tempest API."""
+def get_tempest_data(start_ts, end_ts, api_token, device_id):
+    """Fetches weather data from the Tempest API using device endpoint.
+    
+    Note: Use device_id (e.g., 83997) NOT station_id (e.g., 25998)
+    The device endpoint supports historical data, station endpoint does not.
+    """
 
-    url = f"https://swd.weatherflow.com/swd/rest/observations/station/{station_id}"
+    url = f"https://swd.weatherflow.com/swd/rest/observations/device/{device_id}"
 
     headers = {
         "Content-Type": "application/json",
@@ -46,13 +50,52 @@ def get_tempest_data(start_ts, end_ts, api_token, station_id):
         response = requests.get(url, headers=headers, params=params, timeout=10)
         response.raise_for_status()
         data = response.json()
-        return data.get("obs", [])
+        
+        # Device endpoint returns obs as arrays, not dicts
+        obs_arrays = data.get("obs", [])
+        
+        # Handle None or missing obs data
+        if obs_arrays is None:
+            return []
+        
+        # Convert array format to dict format for compatibility
+        # Array indices: [0]=timestamp, [1]=lull, [2]=avg, [3]=gust, [4]=dir, [5]=pressure, 
+        # [6]=temp, [7]=humidity, [8]=illuminance, [9]=uv, [10]=solar, [11]=rain_prev_min,
+        # [12]=precip_type, [13]=lightning_avg_dist, [14]=lightning_count, [15]=battery, [16]=interval
+        
+        converted_obs = []
+        for obs in obs_arrays:
+            if len(obs) >= 17:  # Ensure we have all fields
+                converted_obs.append({
+                    'timestamp': obs[0],
+                    'wind_lull': obs[1],
+                    'wind_avg': obs[2],
+                    'wind_gust': obs[3],
+                    'wind_direction': obs[4],
+                    'station_pressure': obs[5],
+                    'air_temperature': obs[6],
+                    'relative_humidity': obs[7],
+                    'illuminance': obs[8],
+                    'uv': obs[9],
+                    'solar_radiation': obs[10],
+                    'precip': obs[11],  # rain in previous minute
+                    'precip_type': obs[12],
+                    'lightning_strike_avg_distance': obs[13],
+                    'lightning_strike_count': obs[14],
+                    'battery': obs[15],
+                    'report_interval': obs[16],
+                })
+        
+        return converted_obs
 
     except requests.exceptions.RequestException as e:
-        logging.error("Error fetching Tempest data: %s", e)  # Use logging
+        logging.error("Error fetching Tempest data: %s", e)
         return []
     except ValueError as e:
         logging.error("Error parsing JSON: %s", e)
+        return []
+    except IndexError as e:
+        logging.error("Error parsing observation array: %s", e)
         return []
 
 
@@ -173,12 +216,12 @@ def insert_into_csv(data, output_file):
         logging.exception("Error writing to CSV: %s", e)  # Use logging
 
 
-def main(api_token, station_id, start_date_str, output_file, db_path=None, mode='csv'):
+def main(api_token, device_id, start_date_str, output_file, db_path=None, mode='csv'):
     """Main function to orchestrate data retrieval and insertion.
     
     Args:
         api_token: WeatherFlow API token
-        station_id: WeatherFlow station ID
+        device_id: WeatherFlow device ID (e.g., 83997 for Tempest sensor)
         start_date_str: Start date in YYYY-MM-DD format
         output_file: Output CSV file (for csv mode)
         db_path: Path to WeeWX SQLite database (for db mode)
@@ -209,7 +252,7 @@ def main(api_token, station_id, start_date_str, output_file, db_path=None, mode=
     while current_ts < end_ts:
         try:
             next_ts = min(current_ts + interval, end_ts)
-            tempest_data = get_tempest_data(current_ts, next_ts, api_token, station_id)
+            tempest_data = get_tempest_data(current_ts, next_ts, api_token, device_id)
             
             if tempest_data:
                 if mode == 'db':
@@ -232,7 +275,7 @@ def main(api_token, station_id, start_date_str, output_file, db_path=None, mode=
                     datetime.datetime.fromtimestamp(next_ts)
                 )
             current_ts = next_ts
-            time.sleep(1)  # Be nice to the API
+            time.sleep(5)  # Be nice to the API (5s delay to avoid 429 rate limits)
 
         except Exception as e:
             logging.exception("Error during processing: %s", e)
@@ -259,9 +302,9 @@ if __name__ == "__main__":
         help="Your Tempest API token (defaults to env var TEMPEST_API_TOKEN)",
     )
     parser.add_argument(
-        "--station_id",
-        default=os.environ.get("TEMPEST_STATION_ID", DEFAULT_STATION_ID),
-        help="Your Tempest station ID (defaults to env var TEMPEST_STATION_ID)",
+        "--device_id",
+        default=os.environ.get("TEMPEST_DEVICE_ID", DEFAULT_DEVICE_ID),
+        help="Your Tempest device ID (NOT station ID - e.g., 83997 for Tempest sensor)",
     )
     parser.add_argument(
         "--start_date",
@@ -288,9 +331,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Check for required arguments being placeholders
-    if args.api_token == "YOUR_API_TOKEN" or args.station_id == "YOUR_STATION_ID":
+    if args.api_token == "YOUR_API_TOKEN" or args.device_id == "YOUR_DEVICE_ID":
         logging.error(
-            "API token and Station ID must be set via command line arguments or environment variables."
+            "API token and Device ID must be set via command line arguments or environment variables."
         )
         exit(1)  # Exit with an error code
 
@@ -300,4 +343,4 @@ if __name__ == "__main__":
         logging.error("Either create the database or use --mode csv")
         exit(1)
 
-    main(args.api_token, args.station_id, args.start_date, args.output_file, args.db_path, args.mode)
+    main(args.api_token, args.device_id, args.start_date, args.output_file, args.db_path, args.mode)
