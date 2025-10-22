@@ -7,13 +7,18 @@ import logging
 import time
 import os
 import requests
+import sqlite3
+from typing import List, Dict, Any
 
 # --- Configuration ---
 # Default values - can be overridden by command-line arguments or environment variables
-DEFAULT_API_TOKEN = "YOUR_API_TOKEN"  # Replace with a placeholder
-DEFAULT_STATION_ID = "YOUR_STATION_ID"  # Replace with a placeholder
+DEFAULT_API_TOKEN = "0a36ab0b-baf7-4a0f-a108-e78119ccba96"  # Replace with a placeholder
+DEFAULT_STATION_ID = "25998"  # Replace with a placeholder
 DEFAULT_START_DATE = "2020-01-01"  # YYYY-MM-DD
 DEFAULT_OUTPUT_FILE = "wx.csv"
+DEFAULT_DB_PATH = "/data/archive/weewx.sdb"  # WeeWX database path
+DEFAULT_INTERVAL = 5  # 5-minute archive interval (standard for WeeWX)
+DEFAULT_US_UNITS = 1  # 1 = US customary units (F, mph, inHg)
 # --- End Configuration ---
 
 # Setup logging
@@ -51,6 +56,71 @@ def get_tempest_data(start_ts, end_ts, api_token, station_id):
         return []
 
 
+def convert_tempest_to_weewx(obs: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert a single Tempest observation to WeeWX format.
+    
+    Tempest API returns observations as dictionaries with named keys.
+    """
+    return {
+        "dateTime": obs.get('timestamp'),  # Unix epoch timestamp
+        "usUnits": DEFAULT_US_UNITS,  # US customary units
+        "interval": DEFAULT_INTERVAL,  # 5-minute archive interval
+        "outTemp": (obs.get('air_temperature') * 9 / 5) + 32 if obs.get('air_temperature') is not None else None,  # C to F
+        "windSpeed": obs.get('wind_avg') * 2.23694 if obs.get('wind_avg') is not None else None,  # m/s to mph
+        "windGust": obs.get('wind_gust') * 2.23694 if obs.get('wind_gust') is not None else None,  # m/s to mph
+        "windDir": obs.get('wind_direction'),  # degrees
+        "barometer": obs.get('sea_level_pressure') * 0.02953 if obs.get('sea_level_pressure') is not None else None,  # hPa to inHg
+        "outHumidity": obs.get('relative_humidity'),  # percent
+        "rain": obs.get('precip') / 25.4 if obs.get('precip') is not None else None,  # mm to inches
+        "UV": obs.get('uv'),  # UV index
+        "radiation": obs.get('solar_radiation'),  # W/m²
+        "lightning_distance": obs.get('lightning_strike_last_distance') * 0.621371 if obs.get('lightning_strike_last_distance') is not None else None,  # km to miles
+    }
+
+
+def insert_into_database(data: List[List[Any]], db_path: str) -> int:
+    """Insert Tempest data directly into WeeWX SQLite database."""
+    inserted_count = 0
+    skipped_count = 0
+    
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        for obs in data:
+            weewx_record = convert_tempest_to_weewx(obs)
+            date_time = weewx_record['dateTime']
+            
+            # Check if record already exists
+            cursor.execute("SELECT COUNT(*) FROM archive WHERE dateTime = ?", (date_time,))
+            exists = cursor.fetchone()[0] > 0
+            
+            if exists:
+                skipped_count += 1
+                continue
+            
+            # Insert the record
+            columns = ', '.join(weewx_record.keys())
+            placeholders = ', '.join(['?' for _ in weewx_record])
+            query = f"INSERT INTO archive ({columns}) VALUES ({placeholders})"
+            
+            cursor.execute(query, list(weewx_record.values()))
+            inserted_count += 1
+        
+        conn.commit()
+        conn.close()
+        
+        logging.info(f"Database insert: {inserted_count} inserted, {skipped_count} skipped (duplicates)")
+        return inserted_count
+        
+    except sqlite3.Error as e:
+        logging.error(f"SQLite error: {e}")
+        return 0
+    except Exception as e:
+        logging.exception(f"Error writing to database: {e}")
+        return 0
+
+
 def insert_into_csv(data, output_file):
     """Inserts Tempest data into a CSV file, mapping to a Weewx-like schema."""
     try:
@@ -65,6 +135,8 @@ def insert_into_csv(data, output_file):
                 writer.writerow(
                     [
                         "dateTime",
+                        "usUnits",
+                        "interval",
                         "outTemp",
                         "windSpeed",
                         "windGust",
@@ -79,40 +151,39 @@ def insert_into_csv(data, output_file):
                 )
 
             for obs in data:
-                # Map Tempest data to Weewx-like schema (with conversions)
-                weewx_data = {
-                    "dateTime": obs[0],  # Timestamp
-                    "outTemp": (
-                        (obs[8] * 9 / 5) + 32 if obs[8] is not None else None
-                    ),  # C to F
-                    "windSpeed": (
-                        obs[3] * 2.23694 if obs[3] is not None else None
-                    ),  # m/s to mph
-                    "windGust": (
-                        obs[4] * 2.23694 if obs[4] is not None else None
-                    ),  # m/s to mph
-                    "windDir": obs[5],
-                    "barometer": (
-                        obs[6] * 0.02953 if obs[6] is not None else None
-                    ),  # hPa to inHg
-                    "outHumidity": obs[9],
-                    "rain": (
-                        obs[13] / 25.4 if obs[13] is not None else None
-                    ),  # mm to inches
-                    "UV": obs[11],
-                    "radiation": obs[12],
-                    "lightning_distance": (
-                        obs[17] * 0.621371 if obs[17] is not None else None
-                    ),  # km to miles,
-                }
-                writer.writerow(weewx_data.values())  # Write data (values)
+                weewx_record = convert_tempest_to_weewx(obs)
+                # Write only the columns we defined in the header
+                writer.writerow([
+                    weewx_record['dateTime'],
+                    weewx_record['usUnits'],
+                    weewx_record['interval'],
+                    weewx_record['outTemp'],
+                    weewx_record['windSpeed'],
+                    weewx_record['windGust'],
+                    weewx_record['windDir'],
+                    weewx_record['barometer'],
+                    weewx_record['outHumidity'],
+                    weewx_record['rain'],
+                    weewx_record['UV'],
+                    weewx_record['radiation'],
+                    weewx_record['lightning_distance'],
+                ])
 
     except Exception as e:
         logging.exception("Error writing to CSV: %s", e)  # Use logging
 
 
-def main(api_token, station_id, start_date_str, output_file):
-    """Main function to orchestrate data retrieval and insertion."""
+def main(api_token, station_id, start_date_str, output_file, db_path=None, mode='csv'):
+    """Main function to orchestrate data retrieval and insertion.
+    
+    Args:
+        api_token: WeatherFlow API token
+        station_id: WeatherFlow station ID
+        start_date_str: Start date in YYYY-MM-DD format
+        output_file: Output CSV file (for csv mode)
+        db_path: Path to WeeWX SQLite database (for db mode)
+        mode: 'csv' or 'db' - determines output method
+    """
 
     try:
         start_date = datetime.datetime.strptime(start_date_str, "%Y-%m-%d")
@@ -125,20 +196,40 @@ def main(api_token, station_id, start_date_str, output_file):
     end_ts = int(end_date.timestamp())
 
     current_ts = start_ts
-    interval = 86400  # 1 day
+    interval = 86400  # 1 day chunks
+    total_inserted = 0
+    total_skipped = 0
+
+    logging.info(f"Starting backfill in '{mode}' mode from {start_date_str} to now")
+    if mode == 'db':
+        logging.info(f"Target database: {db_path}")
+    else:
+        logging.info(f"Target CSV file: {output_file}")
 
     while current_ts < end_ts:
         try:
             next_ts = min(current_ts + interval, end_ts)
             tempest_data = get_tempest_data(current_ts, next_ts, api_token, station_id)
+            
             if tempest_data:
-                insert_into_csv(tempest_data, output_file)
+                if mode == 'db':
+                    inserted = insert_into_database(tempest_data, db_path)
+                    total_inserted += inserted
+                    total_skipped += (len(tempest_data) - inserted)
+                else:
+                    insert_into_csv(tempest_data, output_file)
+                    total_inserted += len(tempest_data)
+                
                 logging.info(
-                    "Finished writing data for %s", datetime.datetime.fromtimestamp(current_ts)
+                    "Processed %d records for %s", 
+                    len(tempest_data),
+                    datetime.datetime.fromtimestamp(current_ts)
                 )
             else:
                 logging.warning(
-                    "No data retrieved for timestamp range: %s", {current_ts} - {next_ts}
+                    "No data retrieved for timestamp range: %s to %s", 
+                    datetime.datetime.fromtimestamp(current_ts),
+                    datetime.datetime.fromtimestamp(next_ts)
                 )
             current_ts = next_ts
             time.sleep(1)  # Be nice to the API
@@ -146,33 +237,52 @@ def main(api_token, station_id, start_date_str, output_file):
         except Exception as e:
             logging.exception("Error during processing: %s", e)
             logging.error(
-                "Error retrieving/writing results for %s", datetime.datetime.fromtimestamp(current_ts)"
+                "Error retrieving/writing results for %s", datetime.datetime.fromtimestamp(current_ts)
             )
+    
+    # Summary
+    logging.info("="*60)
+    logging.info("BACKFILL COMPLETE")
+    logging.info(f"Total records inserted: {total_inserted}")
+    if mode == 'db':
+        logging.info(f"Total records skipped (duplicates): {total_skipped}")
+    logging.info("="*60)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Backfill Weewx database with Tempest data."
+        description="Backfill WeeWX database with Tempest data."
     )
     parser.add_argument(
         "--api_token",
         default=os.environ.get("TEMPEST_API_TOKEN", DEFAULT_API_TOKEN),
-        help="Your Tempest API token (defaults to env var TEMPEST_API_TOKEN or placeholder)",
+        help="Your Tempest API token (defaults to env var TEMPEST_API_TOKEN)",
     )
     parser.add_argument(
         "--station_id",
         default=os.environ.get("TEMPEST_STATION_ID", DEFAULT_STATION_ID),
-        help="Your Tempest station ID (defaults to env var TEMPEST_STATION_ID or placeholder)",
+        help="Your Tempest station ID (defaults to env var TEMPEST_STATION_ID)",
     )
     parser.add_argument(
         "--start_date",
         default=DEFAULT_START_DATE,
-        help="Start date for backfill (YYYY-MM-DD, defaults to 2020-08-07)",
+        help="Start date for backfill (YYYY-MM-DD, defaults to 2020-01-01)",
     )
     parser.add_argument(
         "--output_file",
         default=DEFAULT_OUTPUT_FILE,
-        help="Output CSV file (defaults to wx.csv)",
+        help="Output CSV file (for csv mode, defaults to wx.csv)",
+    )
+    parser.add_argument(
+        "--db_path",
+        default=os.environ.get("WEEWX_DB_PATH", DEFAULT_DB_PATH),
+        help="Path to WeeWX SQLite database (for db mode, defaults to /data/archive/weewx.sdb)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=['csv', 'db'],
+        default='db',
+        help="Output mode: 'csv' for CSV file, 'db' for direct SQLite insert (default: db)",
     )
 
     args = parser.parse_args()
@@ -184,4 +294,10 @@ if __name__ == "__main__":
         )
         exit(1)  # Exit with an error code
 
-    main(args.api_token, args.station_id, args.start_date, args.output_file)
+    # Validate database path for db mode
+    if args.mode == 'db' and not os.path.exists(args.db_path):
+        logging.error(f"Database file not found: {args.db_path}")
+        logging.error("Either create the database or use --mode csv")
+        exit(1)
+
+    main(args.api_token, args.station_id, args.start_date, args.output_file, args.db_path, args.mode)
